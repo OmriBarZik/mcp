@@ -16,8 +16,17 @@ import {
 } from "./format.js";
 import { buildIcs } from "./logic/ics.js";
 import { buildSchedule } from "./logic/schedule.js";
-import { applyFilters, expandTerms, scoreSession, searchSessions, tokenize } from "./logic/search.js";
+import {
+  applyFilters,
+  expandTerms,
+  matchesTrack,
+  resolveDay,
+  scoreSession,
+  searchSessions,
+  tokenize,
+} from "./logic/search.js";
 import { hhmm, toVenueWallTime, venueNow } from "./logic/time.js";
+import { recordToolCall, trackEvent, type ToolInsight, type ToolOutcome } from "./metrics.js";
 
 /** Every free-text argument is length-bounded. */
 const text = (max = 300) => z.string().trim().max(max);
@@ -38,18 +47,58 @@ const tracksArg = z
   .describe('Only these tracks, e.g. ["AI/ML", "Backend", "Frontend/Product"]. get_conference_info lists them all.');
 const excludeTracksArg = z.array(text(40)).max(10).optional().describe("Leave out these tracks.");
 
-function wrap<A>(fn: (args: A, agenda: Agenda) => unknown | Promise<unknown>) {
+// ---------------------------------------------------------------------------
+// Analytics helpers. They only ever emit values from the agenda or fixed vocabularies,
+// never the attendee's free text (see src/metrics.ts).
+
+/** Agenda track names matched by the attendee's track filters (unknown values are dropped). */
+function knownTracks(agenda: Agenda, inputs: string[] | undefined): string | undefined {
+  if (!inputs?.length) return undefined;
+  const hits = agenda.tracks.filter((t) => inputs.some((i) => matchesTrack({ track: t } as Session, i)));
+  return hits.length ? hits.join(",") : "unknown";
+}
+
+/** The ISO date of a day filter, or "unknown". */
+function knownDay(agenda: Agenda, input: string | undefined): string | undefined {
+  if (!input) return undefined;
+  return resolveDay(input, agenda.days) ?? "unknown";
+}
+
+function existingIds(agenda: Agenda, ids: string[] | undefined): string[] {
+  const all = new Set(agenda.sessions.map((s) => s.id));
+  return [...new Set(ids ?? [])].filter((id) => all.has(id));
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Insight<A> = (args: A, result: any, agenda: Agenda) => ToolInsight;
+
+function wrap<A>(tool: string, fn: (args: A, agenda: Agenda) => unknown | Promise<unknown>, insight?: Insight<A>) {
   return async (args: A) => {
+    const started = performance.now();
+    let agenda: Agenda | undefined;
+    let outcome: ToolOutcome = "ok";
+    let info: ToolInsight = {};
     try {
-      const agenda = await getAgenda();
+      agenda = await getAgenda();
       const result = await fn(args, agenda);
+      try {
+        info = insight?.(args, result, agenda) ?? {};
+      } catch {
+        // analytics must never break a tool
+      }
       if (result && typeof result === "object" && "content" in result) return result as ReturnType<typeof json>;
       return json(result);
     } catch (err) {
-      if (err instanceof UserError) return errorResult(err.message);
+      if (err instanceof UserError) {
+        outcome = "user_error";
+        return errorResult(err.message);
+      }
+      outcome = "internal_error";
       // Never leak internals (stack traces, upstream errors) to clients.
       console.error("[reversim-mcp] tool failed:", err);
       return errorResult("Internal error while handling this request.");
+    } finally {
+      recordToolCall(tool, outcome, performance.now() - started, agenda?.source, info);
     }
   };
 }
@@ -80,7 +129,7 @@ export function createServer(): McpServer {
       inputSchema: {},
       annotations: READ_ONLY,
     },
-    wrap((_args: Record<string, never>, agenda) => {
+    wrap("get_conference_info", (_args: Record<string, never>, agenda) => {
       const talks = agenda.sessions.filter((s) => !s.isService);
       return {
         ...CONFERENCE,
@@ -124,7 +173,7 @@ export function createServer(): McpServer {
       },
       annotations: READ_ONLY,
     },
-    wrap((a: {
+    wrap("search_sessions", (a: {
       query?: string; day?: string; tracks?: string[]; room?: string; speaker?: string;
       startsAfter?: string; endsBefore?: string; includeBreaks?: boolean; limit?: number;
     }, agenda) => {
@@ -149,7 +198,18 @@ export function createServer(): McpServer {
           ? { hint: "No matches. Try broader words, drop filters, or call recommend_sessions." }
           : {}),
       };
-    }),
+    }, (a, r, agenda) => ({
+      resultCount: r.total,
+      params: {
+        has_query: Boolean(a.query),
+        query_length: a.query?.length,
+        day: knownDay(agenda, a.day),
+        track: knownTracks(agenda, a.tracks),
+        has_room: Boolean(a.room),
+        has_speaker: Boolean(a.speaker),
+        has_time_window: Boolean(a.startsAfter || a.endsBefore),
+      },
+    })),
   );
 
   // -------------------------------------------------------------------------
@@ -163,13 +223,17 @@ export function createServer(): McpServer {
       },
       annotations: READ_ONLY,
     },
-    wrap((a: { ids: string[] }, agenda) => {
+    wrap("get_sessions", (a: { ids: string[] }, agenda) => {
       const byId = new Map(agenda.sessions.map((s) => [s.id, s]));
       return {
         sessions: a.ids.filter((id) => byId.has(id)).map((id) => full(byId.get(id)!, agenda)),
         notFound: a.ids.filter((id) => !byId.has(id)),
       };
-    }),
+    }, (a, r, agenda) => ({
+      resultCount: r.sessions.length,
+      params: { requested: a.ids.length },
+      selected: { source: "get_sessions", ids: existingIds(agenda, a.ids) },
+    })),
   );
 
   // -------------------------------------------------------------------------
@@ -187,7 +251,7 @@ export function createServer(): McpServer {
       },
       annotations: READ_ONLY,
     },
-    wrap((a: { name?: string; query?: string; limit?: number }, agenda) => {
+    wrap("find_speakers", (a: { name?: string; query?: string; limit?: number }, agenda) => {
       if (!a.name && !a.query) throw new UserError("Provide a name or a query.");
       const byId = new Map(agenda.sessions.map((s) => [s.id, s]));
       const qTokens = a.query ? tokenize(a.query) : [];
@@ -210,7 +274,10 @@ export function createServer(): McpServer {
           sessions: sp.sessionIds.filter((id) => byId.has(id)).map((id) => brief(byId.get(id)!, agenda)),
         })),
       };
-    }),
+    }, (a, r) => ({
+      resultCount: r.total,
+      params: { has_name: Boolean(a.name), has_query: Boolean(a.query) },
+    })),
   );
 
   // -------------------------------------------------------------------------
@@ -235,7 +302,7 @@ export function createServer(): McpServer {
       },
       annotations: READ_ONLY,
     },
-    wrap((a: {
+    wrap("recommend_sessions", (a: {
       interests: string; role?: string; avoid?: string; day?: string;
       tracks?: string[]; excludeTracks?: string[]; limit?: number;
     }, agenda) => {
@@ -276,7 +343,18 @@ export function createServer(): McpServer {
         otherTalks: rest.map((r) => ({ id: r.session.id, title: r.session.title, track: r.session.track, when: brief(r.session, agenda).when })),
         data: dataNote(agenda),
       };
-    }),
+    }, (a, r, agenda) => ({
+      // "Results" = candidates the keyword pass actually matched.
+      resultCount: r.candidates.filter((c: { keywordScore: number }) => c.keywordScore > 0).length,
+      params: {
+        interests_length: a.interests.length,
+        has_role: Boolean(a.role),
+        has_avoid: Boolean(a.avoid),
+        day: knownDay(agenda, a.day),
+        track: knownTracks(agenda, a.tracks),
+        exclude_track: knownTracks(agenda, a.excludeTracks),
+      },
+    })),
   );
 
   // -------------------------------------------------------------------------
@@ -296,7 +374,7 @@ export function createServer(): McpServer {
       },
       annotations: READ_ONLY,
     },
-    wrap((a: { mustSee?: string[]; interests?: string; days?: string[]; excludeTracks?: string[] }, agenda) => {
+    wrap("build_schedule", (a: { mustSee?: string[]; interests?: string; days?: string[]; excludeTracks?: string[] }, agenda) => {
       const result = buildSchedule(agenda, a);
       const mini = (s: Session) => ({ id: s.id, title: s.title, room: s.room, track: s.track });
       const pickedIds = result.days.flatMap((d) => d.entries.filter((e) => e.why !== "break").map((e) => e.session.id));
@@ -328,6 +406,20 @@ export function createServer(): McpServer {
         sessionIds: pickedIds,
         next: "Review with the attendee, swap via alsoAtThisTime/openSlots if they prefer, then call export_calendar with sessionIds.",
       };
+    }, (a, r, agenda) => {
+      const params = {
+        must_see_count: a.mustSee?.length ?? 0,
+        has_interests: Boolean(a.interests),
+        days: a.days?.map((d) => knownDay(agenda, d)).join(","),
+        exclude_track: knownTracks(agenda, a.excludeTracks),
+        conflicts: r.conflicts.length,
+      };
+      return {
+        resultCount: r.sessionIds.length,
+        params,
+        selected: { source: "must_see", ids: existingIds(agenda, a.mustSee) },
+        milestones: [{ name: "schedule_built", params: { ...params, session_count: r.sessionIds.length } }],
+      };
     }),
   );
 
@@ -349,7 +441,7 @@ export function createServer(): McpServer {
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    wrap((a: { at?: string; day?: string; tracks?: string[] }, agenda) => {
+    wrap("whats_on", (a: { at?: string; day?: string; tracks?: string[] }, agenda) => {
       let dayIso: string | undefined;
       if (a.day) {
         dayIso = applyFilters(agenda, { day: a.day, includeService: true })[0]?.day;
@@ -386,7 +478,14 @@ export function createServer(): McpServer {
           startsInMinutes: Math.round((Date.parse(`${s.startsAt}Z`) - Date.parse(`${t}Z`)) / 60000),
         })),
       };
-    }),
+    }, (a, r, agenda) => ({
+      params: {
+        has_at: Boolean(a.at),
+        day: knownDay(agenda, a.day),
+        track: knownTracks(agenda, a.tracks),
+        status: r.status ?? "during the conference",
+      },
+    })),
   );
 
   // -------------------------------------------------------------------------
@@ -402,7 +501,7 @@ export function createServer(): McpServer {
       },
       annotations: READ_ONLY,
     },
-    wrap((a: { sessionIds: string[] }, agenda) => {
+    wrap("export_calendar", (a: { sessionIds: string[] }, agenda) => {
       const byId = new Map(agenda.sessions.map((s) => [s.id, s]));
       const sessions = [...new Set(a.sessionIds)]
         .filter((id) => byId.has(id))
@@ -427,6 +526,13 @@ export function createServer(): McpServer {
           },
         ],
       };
+    }, (a, _r, agenda) => {
+      const ids = existingIds(agenda, a.sessionIds);
+      return {
+        resultCount: ids.length,
+        selected: { source: "export_calendar", ids },
+        milestones: [{ name: "calendar_exported", params: { session_count: ids.length } }],
+      };
     }),
   );
 
@@ -441,6 +547,7 @@ export function createServer(): McpServer {
     },
     async (uri) => {
       const agenda = await getAgenda();
+      trackEvent("agenda_viewed", { data_source: agenda.source });
       return {
         contents: [
           {
@@ -462,21 +569,24 @@ export function createServer(): McpServer {
         about_me: text(500).optional().describe("Your role and what you'd like to get out of the conference."),
       },
     },
-    ({ about_me }) => ({
-      messages: [
-        {
-          role: "user" as const,
-          content: {
-            type: "text" as const,
-            text:
-              `Help me plan my ${CONFERENCE.name}.` +
-              (about_me ? ` About me: ${about_me}.` : " First ask me 2–3 short questions about my role and interests.") +
-              " Then use recommend_sessions, suggest a shortlist with one line on why each fits me, " +
-              "build a clash-free plan with build_schedule (mention clashes and alternatives), and offer to export it with export_calendar.",
+    ({ about_me }) => {
+      trackEvent("prompt_used", { prompt: "plan_my_reversim", has_about_me: Boolean(about_me) });
+      return {
+        messages: [
+          {
+            role: "user" as const,
+            content: {
+              type: "text" as const,
+              text:
+                `Help me plan my ${CONFERENCE.name}.` +
+                (about_me ? ` About me: ${about_me}.` : " First ask me 2–3 short questions about my role and interests.") +
+                " Then use recommend_sessions, suggest a shortlist with one line on why each fits me, " +
+                "build a clash-free plan with build_schedule (mention clashes and alternatives), and offer to export it with export_calendar.",
+            },
           },
-        },
-      ],
-    }),
+        ],
+      };
+    },
   );
 
   return server;

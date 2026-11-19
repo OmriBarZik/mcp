@@ -21,7 +21,7 @@ Every control below is enforced in code, and most have a test in
 | MCP tools | 8 read-only tools, all with `readOnlyHint: true` | No tool writes, deletes, sends, or reads files/env |
 | MCP resources | `reversim://agenda` (public agenda as Markdown) | No resource templates and no file:// access |
 | Static files | `public/robots.txt` (`Disallow: /`) | Source, `package.json`, tests etc. are **not** served (`outputDirectory: public`) |
-| Outbound network | 2 hard-coded Sessionize URLs (`src/config.ts`) | No URL is ever built from user input, so there is no SSRF |
+| Outbound network | 2 hard-coded Sessionize URLs, plus the hard-coded Google Analytics collect URL when GA is configured (`src/config.ts`) | No URL is ever built from user input, so there is no SSRF |
 
 The server is **stateless**: no sessions, no SSE streams, no database, no cookies.
 Nothing is stored between requests except a 10-minute in-memory cache of the
@@ -82,6 +82,26 @@ Checks run in this order and fail closed:
 **No ReDoS risk.** No user input is ever compiled into a regular expression.
 All regexes are fixed and linear.
 
+## 3a. Metrics and analytics (`src/metrics.ts`)
+
+- **Session id:** a random UUID returned as `Mcp-Session-Id` on `initialize` and read back
+  on later requests, used only to group metrics. The server keeps no session state and never
+  rejects a request because of this header. Values that aren't a UUID are ignored.
+- **What leaves the server:** when `GA_MEASUREMENT_ID` and `GA_API_SECRET` are set, events go
+  to the Google Analytics Measurement Protocol. They carry tool names, outcomes, counts,
+  durations, and track/day/talk values only when they match the public agenda (otherwise
+  `unknown`). Also sent: the MCP client's name and version, reduced to a safe character set
+  and 60 characters.
+- **Never sent or logged:** free text typed by the attendee (only its length or presence),
+  IP addresses, user agents, auth headers, request bodies. Tests check this with a marker string.
+- **No effect on responses:** events are sent after the response (`waitUntil`) with a 2 s
+  timeout, `redirect: "error"` and no credentials. Failures are only logged (`ga_error`).
+- **Limits:** at most 100 events per request, GA's name and value limits are enforced, and GA's
+  reserved parameter names can't be overridden.
+- **The GA API secret** is a write-only key for one stream. Store it as a Vercel *Sensitive*
+  env var. If it leaks, someone can send fake events to that stream but can't read any data.
+  Rotate it in GA.
+
 ## 4. Prompt-injection hygiene
 
 Abstracts and bios are written by speakers, so they are third-party text that
@@ -98,8 +118,8 @@ uses only CRLF, so a malicious title can't inject extra calendar properties
 
 ## 6. Supply chain
 
-- 3 runtime dependencies, all pinned to exact versions (`.npmrc save-exact`):
-  `@modelcontextprotocol/sdk` (official), `zod`, `slug`. A lockfile is committed.
+- 4 runtime dependencies, all pinned to exact versions (`.npmrc save-exact`):
+  `@modelcontextprotocol/sdk` (official), `zod`, `slug`, `@vercel/functions` (official, for `waitUntil`). A lockfile is committed.
 - `npm audit`: **0 vulnerabilities** at the time of writing.
 - CI (`.github/workflows/ci.yml`) runs typecheck, tests and `npm audit` on every
   push and PR, with `permissions: contents: read`.
@@ -115,6 +135,7 @@ uses only CRLF, so a malicious title can't inject extra calendar properties
 - [ ] Optional: set `ALLOWED_ORIGINS` only if a browser-based client must call the server.
 - [ ] Keep Vercel *Deployment Protection* on preview deployments.
 - [ ] Never add secrets to the repo. The server needs none to run.
+- [ ] Optional: set `GA_MEASUREMENT_ID` and `GA_API_SECRET` (Sensitive) to turn on usage analytics.
 
 ## 8. Configuration reference
 
@@ -124,6 +145,10 @@ uses only CRLF, so a malicious title can't inject extra calendar properties
 | `ALLOWED_ORIGINS` | empty | Comma-separated browser origins allowed to call `/mcp` |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Per-IP, per-instance request limit |
 | `REVERSIM_OFFLINE` | unset | `1` = use only the bundled snapshot, never call Sessionize |
+| `GA_MEASUREMENT_ID` | unset | GA4 stream id (`G-…`). Analytics is on only when this and `GA_API_SECRET` are set |
+| `GA_API_SECRET` | unset | GA4 Measurement Protocol API secret |
+| `GA_DEBUG` | unset | `1` = send to GA's validation endpoint and log the result |
+| `METRICS_LOG` | on | `off` = no JSON metric lines in the logs |
 
 ## 9. Known limitations / accepted risks
 

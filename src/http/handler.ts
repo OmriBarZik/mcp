@@ -1,6 +1,17 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  annotateRequest,
+  cleanClientField,
+  finishRequest,
+  newRequestContext,
+  newSessionId,
+  parseSessionId,
+  runWithContext,
+  trackEvent,
+  type RequestContext,
+} from "../metrics.js";
 import { createServer } from "../server.js";
 import { RateLimiter } from "./rateLimit.js";
 
@@ -14,6 +25,8 @@ import { RateLimiter } from "./rateLimit.js";
  * - Browser `Origin` headers must be on an allowlist (DNS-rebinding / CSRF protection).
  * - Per-IP rate limiting (best effort per instance; pair it with a Vercel Firewall rule).
  * - Strict security headers and no CORS unless an origin is allowlisted.
+ * - Analytics session id: issued as `Mcp-Session-Id` on initialize and read back on later
+ *   requests. The server keeps no session state; the id is only used to group metrics.
  */
 
 export const MAX_BODY_BYTES = 32 * 1024;
@@ -100,7 +113,53 @@ class HttpError extends Error {
   }
 }
 
+/** MCP method names are short identifiers; anything else is logged as "other". */
+function methodName(body: object): string | undefined {
+  const m = (body as { method?: unknown }).method;
+  if (typeof m !== "string") return undefined;
+  return /^[a-z][a-zA-Z/_]{0,60}$/.test(m) ? m : "other";
+}
+
+/**
+ * Sets the conversation id used for metrics. A fresh one is issued on `initialize`
+ * (clients echo it back as Mcp-Session-Id per the MCP spec); later requests reuse the
+ * client's id if it is a well-formed UUID. Nothing is stored or validated server-side.
+ */
+function assignSession(ctx: RequestContext, req: IncomingMessage, res: ServerResponse, body: object, method?: string): void {
+  if (method === "initialize") {
+    ctx.sessionId = newSessionId();
+    ctx.sessionTracked = true;
+    res.setHeader("Mcp-Session-Id", ctx.sessionId);
+    const params = (body as { params?: { clientInfo?: { name?: unknown; version?: unknown }; protocolVersion?: unknown } })
+      .params;
+    const client = cleanClientField(params?.clientInfo?.name);
+    const fields = {
+      client_name: client ?? "unknown",
+      client_version: cleanClientField(params?.clientInfo?.version),
+      protocol_version: cleanClientField(params?.protocolVersion),
+    };
+    annotateRequest(fields);
+    trackEvent("client_connected", fields);
+    return;
+  }
+  const fromClient = parseSessionId(req.headers["mcp-session-id"]);
+  if (fromClient) {
+    ctx.sessionId = fromClient;
+    ctx.sessionTracked = true;
+  }
+}
+
 export async function handleMcpHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const ctx = newRequestContext();
+  const started = performance.now();
+  try {
+    await runWithContext(ctx, () => handle(req, res, ctx));
+  } finally {
+    finishRequest(ctx, res.statusCode, performance.now() - started);
+  }
+}
+
+async function handle(req: IncomingMessage, res: ServerResponse, ctx: RequestContext): Promise<void> {
   applySecurityHeaders(res);
 
   try {
@@ -114,7 +173,11 @@ export async function handleMcpHttp(req: IncomingMessage, res: ServerResponse): 
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
       res.setHeader("Access-Control-Allow-Methods", "POST");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Protocol-Version");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, Mcp-Protocol-Version, Mcp-Session-Id",
+      );
+      res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
       res.setHeader("Access-Control-Max-Age", "600");
       if (req.method === "OPTIONS") {
         res.statusCode = 204;
@@ -154,6 +217,10 @@ export async function handleMcpHttp(req: IncomingMessage, res: ServerResponse): 
       return sendJson(res, 400, "Expected a single JSON-RPC message");
     }
 
+    const method = methodName(body);
+    annotateRequest({ method });
+    assignSession(ctx, req, res, body, method);
+
     const server = createServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless
@@ -167,6 +234,7 @@ export async function handleMcpHttp(req: IncomingMessage, res: ServerResponse): 
     await transport.handleRequest(req, res, body);
   } catch (err) {
     if (err instanceof HttpError) return sendJson(res, err.status, err.message);
+    annotateRequest({ outcome: "internal_error" });
     console.error("[reversim-mcp] request failed:", err instanceof Error ? err.message : "unknown error");
     sendJson(res, 500, "Internal server error");
   }

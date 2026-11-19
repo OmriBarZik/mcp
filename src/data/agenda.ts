@@ -1,4 +1,5 @@
 import { CACHE_TTL_MS, FEEDS, FETCH_TIMEOUT_MS, MAX_FEED_BYTES } from "../config.js";
+import { logMetric } from "../metrics.js";
 import { buildAgenda } from "./normalize.js";
 import { SNAPSHOT } from "./snapshot.js";
 import { validateFeeds } from "./validate.js";
@@ -9,7 +10,7 @@ let snapshotAgenda: Agenda | undefined;
 let inflight: Promise<Agenda> | undefined;
 
 /**
- * The ONLY outbound request this server makes. URLs are compile-time constants
+ * Outbound request to Sessionize (the only other one is the optional GA send in metrics.ts). URLs are compile-time constants
  * (FEEDS); no client input ever reaches a URL, so there is no SSRF surface.
  */
 async function fetchJson(url: (typeof FEEDS)[keyof typeof FEEDS]): Promise<unknown> {
@@ -69,12 +70,20 @@ export async function getAgenda(): Promise<Agenda> {
   if (cached && cached.expiresAt > Date.now()) return cached.agenda;
 
   inflight ??= (async () => {
+    const started = performance.now();
     try {
       const feeds = await fetchFeeds();
       const agenda = buildAgenda(feeds, "live", new Date().toISOString());
       cached = { agenda, expiresAt: Date.now() + CACHE_TTL_MS };
+      logMetric("agenda_fetch", { outcome: "ok", duration_ms: Math.round(performance.now() - started) });
       return agenda;
     } catch (err) {
+      logMetric("agenda_fetch", {
+        outcome: "fallback",
+        fallback: cached ? "last_live" : "snapshot",
+        duration_ms: Math.round(performance.now() - started),
+        error: err instanceof Error ? err.message.slice(0, 200) : "unknown error",
+      });
       console.error(`[reversim-mcp] live fetch failed, using snapshot: ${err instanceof Error ? err.message : "unknown error"}`);
       // Keep serving the last good live copy if we have one, otherwise the snapshot.
       const fallback = cached?.agenda ?? getSnapshotAgenda();

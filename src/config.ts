@@ -20,3 +20,12 @@ export const CACHE_TTL_MS = 10 * 60 * 1000;
 export const FETCH_TIMEOUT_MS = 4000;
 /** Hard cap on each upstream feed (current feeds are ~100–250 KB). */
 export const MAX_FEED_BYTES = 3 * 1024 * 1024;
+
+/**
+ * Google Analytics 4 Measurement Protocol (usage analytics, off unless GA_MEASUREMENT_ID and
+ * GA_API_SECRET are set). Fixed URLs: nothing a client sends is ever part of them.
+ */
+export const GA_COLLECT_URL = "https://www.google-analytics.com/mp/collect";
+export const GA_DEBUG_URL = "https://www.google-analytics.com/debug/mp/collect";
+/** GA sends happen after the response; this only bounds how long the function stays alive. */
+export const GA_TIMEOUT_MS = 2000;
